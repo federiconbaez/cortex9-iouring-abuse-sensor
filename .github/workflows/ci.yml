@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: fmt + clippy + test + corpus + measure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: host info
+        run: |
+          uname -a
+          echo "unprivileged_bpf_disabled=$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo n/a)"
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace -- --nocapture
+      - name: corpus (acceptance)
+        run: cargo run --release --quiet -- corpus
+      - name: blindness
+        run: cargo run --release --quiet -- blindness
+      - name: reproducible measurement
+        run: cargo run --release --quiet -- measure --iters 200000

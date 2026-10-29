@@ -1,0 +1,47 @@
+name: enforce
+
+# Real bpf(BPF_PROG_LOAD) + kprobe attach of the anti-Curing sensor, with sudo.
+# GitHub-hosted runners grant root via sudo and recent kernels allow kprobe BPF,
+# so this SHOULD go green; if a runner ever refuses the load/attach it MUST go
+# red (non-zero exit), never a silent skip. The userspace harness, policy and
+# blindness proof are covered by ci.yml and do not need this job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  bpf-load:
+    name: load sensor + prove io_uring visibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: install bpf toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r) libelf-dev
+      - name: host capability
+        run: |
+          set -euo pipefail
+          uname -a
+          echo "unprivileged_bpf_disabled=$(cat /proc/sys/kernel/unprivileged_bpf_disabled)"
+          sudo cat /sys/kernel/security/lsm || true
+      - name: build trigger binary
+        run: cargo build --release --quiet
+      - name: build BPF object + loader
+        run: |
+          set -euo pipefail
+          ARCH_INC="/usr/include/$(uname -m)-linux-gnu"
+          clang -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 \
+            -I"${ARCH_INC}" -c bpf/sensor.bpf.c -o bpf/sensor.bpf.o
+          cc -O2 -Wall bpf/loader.c -o bpf/loader -lbpf
+      - name: load + attach + trigger (must fail loudly if BPF is unavailable)
+        run: |
+          set -euo pipefail
+          sudo ./bpf/loader bpf/sensor.bpf.o ./target/release/iouring-abuse-sensor /etc/os-release

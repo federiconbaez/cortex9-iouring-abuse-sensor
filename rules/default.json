@@ -1,0 +1,25 @@
+{
+  "sensitive_read_prefixes": [
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers",
+    "/etc/ssl/private",
+    "/root/.ssh/",
+    "/proc/1/",
+    "/proc/kcore"
+  ],
+  "persistence_write_prefixes": [
+    "/etc/cron.d/",
+    "/etc/crontab",
+    "/etc/systemd/system/",
+    "/etc/ld.so.preload",
+    "/root/.ssh/authorized_keys",
+    "/etc/sudoers.d/"
+  ],
+  "allowed_connect_cidrs": [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16"
+  ]
+}
