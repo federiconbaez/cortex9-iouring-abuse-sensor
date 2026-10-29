@@ -37,9 +37,17 @@ enum Cmd {
     },
     /// Issue a single io_uring openat+read of a target (for the in-kernel sensor
     /// test in CI). Prints the raw io_uring result.
+    ///
+    /// With `--ready-fd N` the process synchronises with the BPF loader so the
+    /// measured window contains ONLY the io_uring read: it blocks SIGUSR1, writes
+    /// one byte to fd N ("startup done"), waits for SIGUSR1 ("counters zeroed,
+    /// go"), and only then performs the io_uring open+read. No read(2) is issued
+    /// after the go signal, so a read-syscall hook must observe zero.
     AttackOnce {
         #[arg(long)]
         target: String,
+        #[arg(long)]
+        ready_fd: Option<i32>,
     },
 }
 
@@ -123,7 +131,10 @@ fn main() -> Result<()> {
             }
             enforce(&r)
         }
-        Cmd::AttackOnce { target } => {
+        Cmd::AttackOnce { target, ready_fd } => {
+            if let Some(fd) = ready_fd {
+                barrier_wait(fd)?;
+            }
             let mut ring =
                 uring::Ring::new(8).map_err(|e| anyhow::anyhow!("io_uring_setup failed: {e}"))?;
             let mut be = ops::Backend::IoUring(&mut ring);
@@ -210,4 +221,28 @@ fn policy_latency(rules: &policy::Rules, iters: u64) -> f64 {
     }
     let el = t.elapsed();
     el.as_nanos() as f64 / iters as f64
+}
+
+/// Synchronisation barrier for the CI blindness proof. Blocks SIGUSR1, signals
+/// readiness on `ready_fd`, then waits for SIGUSR1 before returning. After this
+/// returns the caller issues only io_uring ops, so no read(2) happens in the
+/// measured window.
+fn barrier_wait(ready_fd: i32) -> Result<()> {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        if libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+            anyhow::bail!("sigprocmask: {}", std::io::Error::last_os_error());
+        }
+        let one = [1u8];
+        if libc::write(ready_fd, one.as_ptr() as *const libc::c_void, 1) != 1 {
+            anyhow::bail!("barrier ready write: {}", std::io::Error::last_os_error());
+        }
+        let mut sig: libc::c_int = 0;
+        if libc::sigwait(&set, &mut sig) != 0 {
+            anyhow::bail!("sigwait: {}", std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }

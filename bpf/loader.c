@@ -3,19 +3,22 @@
 // libbpf loader + in-CI measurement for the anti-Curing sensor.
 //
 // Steps:
-//   1. open sensor.bpf.o, set the target PID to a child we will fork,
-//   2. load + attach both kprobes (hard failure if the kernel refuses),
-//   3. in the child, exec `iouring-abuse-sensor attack-once --target <file>`
-//      which performs an io_uring open+read of a readable file,
-//   4. read the counters and assert the sensor saw the access (counter[0] >= 1)
-//      while the read-syscall hook did not (counter[1] == 0).
+//   1. open sensor.bpf.o, load + attach both kprobes (hard failure if refused),
+//   2. fork a child that execs `iouring-abuse-sensor attack-once --ready-fd R
+//      --target <file>`, which synchronises on a barrier,
+//   3. once the child signals it is past startup, install the PID filter, ZERO
+//      both counters, and release the child (SIGUSR1) so the measured window
+//      contains only the io_uring open+read,
+//   4. assert the sensor saw the access (counter[0] >= 1) AND the read-syscall
+//      hook did not (counter[1] == 0).
 //
-// Any failure (open/load/attach/trigger/assert) exits non-zero. There is no
-// silent skip: a kernel that cannot load the program fails the job loudly.
+// Any failure exits non-zero. No silent skip: a kernel that cannot load the
+// program fails the job loudly.
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +34,13 @@ static long long get_counter(unsigned int idx)
     if (bpf_map_lookup_elem(counters_fd, &key, &val) != 0)
         return -1;
     return val;
+}
+
+static int zero_counter(unsigned int idx)
+{
+    unsigned int key = idx;
+    long long zero = 0;
+    return bpf_map_update_elem(counters_fd, &key, &zero, BPF_ANY);
 }
 
 int main(int argc, char **argv)
@@ -65,37 +75,42 @@ int main(int argc, char **argv)
         fprintf(stderr, "ENFORCE_FAIL: programs not found\n");
         return 5;
     }
-
-    struct bpf_link *l_perm = bpf_program__attach(p_perm);
-    if (libbpf_get_error(l_perm)) {
+    if (libbpf_get_error(bpf_program__attach(p_perm))) {
         fprintf(stderr,
                 "ENFORCE_FAIL: attach kprobe security_file_permission (%s)\n",
                 strerror(errno));
         return 6;
     }
-    struct bpf_link *l_read = bpf_program__attach(p_read);
-    if (libbpf_get_error(l_read)) {
+    if (libbpf_get_error(bpf_program__attach(p_read))) {
         fprintf(stderr, "ENFORCE_FAIL: attach kprobe __x64_sys_read (%s)\n",
                 strerror(errno));
         return 7;
     }
 
-    // Fork the trigger. Set target PID to the child *before* it runs.
+    // Barrier pipe: child writes one byte when past startup.
+    int pfd[2];
+    if (pipe(pfd) != 0) {
+        perror("pipe");
+        return 8;
+    }
+
     pid_t child = fork();
     if (child < 0) {
         perror("fork");
         return 8;
     }
     if (child == 0) {
-        // Child: become the attack. The parent already filtered on our PID.
-        // Small delay so the parent can install the PID filter.
-        usleep(100000);
-        execl(sensor_bin, sensor_bin, "attack-once", "--target", target_file,
-              (char *)NULL);
+        close(pfd[0]); // child keeps the write end
+        char fdbuf[16];
+        snprintf(fdbuf, sizeof(fdbuf), "%d", pfd[1]);
+        execl(sensor_bin, sensor_bin, "attack-once", "--ready-fd", fdbuf,
+              "--target", target_file, (char *)NULL);
         perror("execl");
         _exit(127);
     }
+    close(pfd[1]); // parent keeps the read end
 
+    // Attribute events to the child before it runs the measured op.
     unsigned int key = 0;
     unsigned int pid = (unsigned int)child;
     if (bpf_map_update_elem(target_fd, &key, &pid, BPF_ANY) != 0) {
@@ -103,12 +118,29 @@ int main(int argc, char **argv)
         return 9;
     }
 
+    // Wait for the child's "startup done" byte, then zero the counters so the
+    // measured window is exactly the upcoming io_uring read.
+    char b = 0;
+    if (read(pfd[0], &b, 1) != 1) {
+        fprintf(stderr, "ENFORCE_FAIL: barrier ready read\n");
+        return 10;
+    }
+    if (zero_counter(0) != 0 || zero_counter(1) != 0) {
+        fprintf(stderr, "ENFORCE_FAIL: zero counters\n");
+        return 11;
+    }
+    // Release the child.
+    if (kill(child, SIGUSR1) != 0) {
+        perror("kill");
+        return 12;
+    }
+
     int status = 0;
     waitpid(child, &status, 0);
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fprintf(stderr, "ENFORCE_FAIL: trigger child failed (status %d)\n",
                 status);
-        return 10;
+        return 13;
     }
 
     long long sensor_hits = get_counter(0);
@@ -122,10 +154,16 @@ int main(int argc, char **argv)
                 "ENFORCE_FAIL: sensor did not observe the io_uring file access "
                 "(got %lld)\n",
                 sensor_hits);
-        return 11;
+        return 14;
     }
-    printf("ENFORCE_OK: sensor caught io_uring access the read-syscall hook saw "
-           "%lld times\n",
-           read_hits);
+    if (read_hits != 0) {
+        fprintf(stderr,
+                "ENFORCE_FAIL: read-syscall hook unexpectedly fired %lld times "
+                "in the measured window\n",
+                read_hits);
+        return 15;
+    }
+    printf("ENFORCE_OK: sensor caught the io_uring read; read-syscall hook was "
+           "blind (0 hits)\n");
     return 0;
 }

@@ -85,13 +85,21 @@ local listener, and reads of benign system files (`/etc/passwd`, `/etc/hosts`,
 ## How the kernel sensor is proven (CI)
 
 `enforce.yml` installs clang + libbpf, builds `bpf/sensor.bpf.o`, loads it with
-**sudo**, attaches a kprobe to `security_file_permission` and one to
-`__x64_sys_read`, then forks a child that performs an io_uring open+read of a
-readable file. It asserts that the sensor counter (file-permission) incremented
-for that PID while the read-syscall counter stayed at zero — the Curing gap,
-demonstrated with a real `bpf(BPF_PROG_LOAD)`. If any step is refused by the
-kernel the job exits non-zero; **there is no silent skip.** `ci.yml` covers fmt,
-clippy, the test suite, and the box-measurable acceptance numbers.
+**sudo**, and attaches a kprobe to `security_file_permission` and one to
+`__x64_sys_read`. It then forks a child that, via a signal barrier, parks past
+its own startup; the loader installs a per-PID filter, **zeroes both counters**,
+and only then releases the child to perform a single io_uring open+read. Because
+the measured window contains only io_uring ops (no `read(2)`), the job can assert
+both halves of the Curing gap: the sensor counter **incremented** (it saw the
+io_uring read) while the read-syscall counter stayed at **exactly zero** (a
+read-hook is blind) — proven with a real `bpf(BPF_PROG_LOAD)`.
+
+Observed in CI run 40818158652 (kernel runner), before the barrier was added,
+the raw counts were 14 (sensor) vs 5 (read-hook); the 5 were process-startup
+`read(2)`s, which is why the barrier/zero step was introduced to isolate the
+io_uring read cleanly. If any step is refused by the kernel the job exits
+non-zero; **there is no silent skip.** `ci.yml` covers fmt, clippy, the test
+suite, and the box-measurable acceptance numbers.
 
 ## Honest limitations / declared gaps
 
